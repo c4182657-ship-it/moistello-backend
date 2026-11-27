@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -387,7 +388,10 @@ func (h *CircleHandler) PreviewPayout(c *gin.Context) {
 		Amount      *float64 `json:"amount"`
 		FeeAmount   *float64 `json:"feeAmount"`
 	}
-	_ = c.ShouldBindJSON(&req)
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.BadRequest(c, "invalid request body")
+		return
+	}
 
 	preview := h.buildPayoutPreview(cir, req.Amount, req.FeeAmount, req.RecipientID, req.RoundNumber)
 	response.OK(c, gin.H{"preview": preview})
@@ -420,7 +424,10 @@ func (h *CircleHandler) TriggerPayout(c *gin.Context) {
 			Amount      *float64 `json:"amount"`
 			FeeAmount   *float64 `json:"feeAmount"`
 		}
-		_ = c.ShouldBindJSON(&previewReq)
+		if err := c.ShouldBindJSON(&previewReq); err != nil {
+			response.BadRequest(c, "invalid request body")
+			return
+		}
 		preview := h.buildPayoutPreview(cir, previewReq.Amount, previewReq.FeeAmount, previewReq.RecipientID, previewReq.RoundNumber)
 		response.OK(c, gin.H{"preview": preview})
 		return
@@ -659,17 +666,16 @@ func (h *CircleHandler) GetRounds(c *gin.Context) {
 	for roundNum := range roundMap {
 		roundNumbers = append(roundNumbers, roundNum)
 	}
+	sort.Ints(roundNumbers)
 
-	for roundNum, entry := range roundMap {
+	rounds := make([]map[string]any, 0, len(roundNumbers))
+	for _, roundNum := range roundNumbers {
+		entry := roundMap[roundNum]
 		configSnapshot, err := h.circleService.QueryRoundConfig(c.Request.Context(), circleID, roundNum)
 		if err == nil && configSnapshot != nil {
 			entry["configSnapshot"] = configSnapshot
 		}
-	}
-
-	rounds := make([]map[string]any, 0, len(roundMap))
-	for _, v := range roundMap {
-		rounds = append(rounds, v)
+		rounds = append(rounds, entry)
 	}
 
 	response.OKWithMeta(c, gin.H{
@@ -793,8 +799,10 @@ func (h *CircleHandler) RemoveMember(c *gin.Context) {
 	var req struct {
 		Reason string `json:"reason"`
 	}
-	// reason is optional; ignore bind errors
-	_ = c.ShouldBindJSON(&req)
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.BadRequest(c, "invalid request body")
+		return
+	}
 
 	if err := h.circleService.RemoveMember(c.Request.Context(), circleID, callerID, memberAddress, req.Reason); err != nil {
 		switch err {

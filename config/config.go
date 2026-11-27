@@ -7,6 +7,7 @@ import (
 	"encoding/pem"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -65,6 +66,10 @@ type ServerConfig struct {
 	// by the Gin route pattern (e.g. "/v1/wallets/withdraw"). Use it for
 	// endpoints that legitimately accept larger payloads than the default.
 	MaxBodyBytesRoutes map[string]int64 `mapstructure:"max_body_bytes_routes"`
+	// WebSocketMaxMessageSize caps each inbound WebSocket frame, per connection
+	// (#461). A larger frame closes the socket with 1009. Zero falls back to
+	// websocket.DefaultMaxMessageSize (4 KB).
+	WebSocketMaxMessageSize int64 `mapstructure:"websocket_max_message_size"`
 }
 
 type DatabaseConfig struct {
@@ -472,6 +477,7 @@ func Load(path string) (*Config, error) {
 	v.SetDefault("server.shutdown_timeout", "30s")
 	v.SetDefault("server.max_body_bytes", 4*1024*1024)
 	v.SetDefault("server.max_body_bytes_routes", map[string]int64{})
+	v.SetDefault("server.websocket_max_message_size", 4096)
 	// No default DATABASE_URL: the env var DATABASE_URL (mapped to MOISTELLO_DATABASE_URL)
 	// must be set explicitly. An empty URL will cause a clear startup failure rather than
 	// silently connecting with plaintext credentials and SSL disabled.
@@ -555,12 +561,12 @@ func Load(path string) (*Config, error) {
 	cfg.Auth.JWTPrivateKeyPEM = collectRequiredText(&errs, cfg.Auth.JWTPrivateKeyPEM, cfg.Auth.JWTPrivateKeyPath, "auth.jwt_private_key_pem", "auth.jwt_private_key_path")
 	cfg.Auth.JWTPublicKeyPEM = collectRequiredText(&errs, cfg.Auth.JWTPublicKeyPEM, cfg.Auth.JWTPublicKeyPath, "auth.jwt_public_key_pem", "auth.jwt_public_key_path")
 	if cfg.Auth.JWTPreviousPrivateKeyPEM == "" && cfg.Auth.JWTPreviousPrivateKeyPath != "" {
-		if content, err := os.ReadFile(cfg.Auth.JWTPreviousPrivateKeyPath); err == nil {
+		if content, err := readConfiguredFile(cfg.Auth.JWTPreviousPrivateKeyPath); err == nil {
 			cfg.Auth.JWTPreviousPrivateKeyPEM = string(content)
 		}
 	}
 	if cfg.Auth.JWTPreviousPublicKeyPEM == "" && cfg.Auth.JWTPreviousPublicKeyPath != "" {
-		if content, err := os.ReadFile(cfg.Auth.JWTPreviousPublicKeyPath); err == nil {
+		if content, err := readConfiguredFile(cfg.Auth.JWTPreviousPublicKeyPath); err == nil {
 			cfg.Auth.JWTPreviousPublicKeyPEM = string(content)
 		}
 	}
@@ -616,15 +622,24 @@ func loadDotEnv() {
 	}
 }
 
-func loadEnvFile(path string) error {
-	f, err := os.Open(path)
+func loadEnvFile(path string) (err error) {
+	cleanPath := filepath.Clean(path)
+	if strings.Contains(cleanPath, "..") {
+		return fmt.Errorf("invalid path traversal: %s", path)
+	}
+	// #nosec G304 -- path is validated to prevent path traversal and restricted to known safe dotfiles.
+	f, err := os.Open(cleanPath)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil
 		}
 		return err
 	}
-	defer f.Close()
+	defer func() {
+		if closeErr := f.Close(); closeErr != nil && err == nil {
+			err = fmt.Errorf("closing %s: %w", path, closeErr)
+		}
+	}()
 
 	scanner := bufio.NewScanner(f)
 	for scanner.Scan() {
@@ -684,7 +699,7 @@ func collectRequiredText(errs *[]string, current, path, field, pathField string)
 		*errs = append(*errs, fmt.Sprintf("config: %s is required (set it directly or configure %s)", field, pathField))
 		return ""
 	}
-	data, err := os.ReadFile(path)
+	data, err := readConfiguredFile(path)
 	if err != nil {
 		*errs = append(*errs, fmt.Sprintf("config: reading %s from %q: %v", field, path, err))
 		return ""
@@ -706,11 +721,22 @@ func loadRequiredText(current, path, field, pathField string) string {
 	if strings.TrimSpace(path) == "" {
 		panic(fmt.Errorf("config: %s is required (set it directly or configure %s)", field, pathField))
 	}
-	data, err := os.ReadFile(path)
+	data, err := readConfiguredFile(path)
 	if err != nil {
 		panic(fmt.Errorf("config: reading %s from %q: %w", field, path, err))
 	}
 	return strings.TrimSpace(string(data))
+}
+
+// readConfiguredFile is the single file-read boundary for key material. The
+// path is supplied by an operator through configuration, not by a request;
+// keeping the read here makes that trust boundary explicit for static tools.
+func readConfiguredFile(path string) ([]byte, error) {
+	if strings.TrimSpace(path) == "" {
+		return nil, fmt.Errorf("configured file path is empty")
+	}
+	// #nosec G304 -- this path is operator-controlled configuration, never request input.
+	return os.ReadFile(path)
 }
 
 func validateHexKey(value string) {

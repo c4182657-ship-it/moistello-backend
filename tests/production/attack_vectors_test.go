@@ -25,6 +25,12 @@ import (
 // the equivalent logic with pure Go assertions.
 // ---------------------------------------------------------------------------
 
+var tierMatrix = map[UserTier]tierConfig{
+	TierBasic:    {MaxMembers: 10, MaxContribution: 100, CollateralRequired: 50},
+	TierVerified: {MaxMembers: 30, MaxContribution: 500, CollateralRequired: 100},
+	TierPremium:  {MaxMembers: 100, MaxContribution: 5000, CollateralRequired: 200},
+}
+
 type VoteType string
 
 const (
@@ -338,43 +344,11 @@ func (g *GovernanceSim) Unpause(caller string) error {
 	return nil
 }
 
-// ---------------------------------------------------------------------------
-// Reputation Simulation Helpers
-//
-// These helpers simulate the on-chain MOI score calculation to verify
-// invariant enforcement (cap at 1000, floor at 0, etc.).
-// ---------------------------------------------------------------------------
-
-func simulationAddPoints(current, points int) int {
-	result := current + points
-	if result > 1000 {
-		return 1000
-	}
-	return result
-}
-
-func simulationSubtractPoints(current, points int) int {
-	result := current - points
-	if result < 0 {
-		return 0
-	}
-	return result
-}
-
-func simulationInactivityDecay(current, daysInactive int) int {
-	// Each day of inactivity subtracts 2 points (proportional decay)
-	decay := daysInactive * 2
-	if decay > current {
-		return 0
-	}
-	return current - decay
-}
-
-// ---------------------------------------------------------------------------
+// --------------------------------------------------------------------------
 // Circle Simulation Helpers
 //
 // Simulate tier-based enforcement and reentrancy protection.
-// ---------------------------------------------------------------------------
+// --------------------------------------------------------------------------
 
 type UserTier string
 
@@ -388,12 +362,6 @@ type tierConfig struct {
 	MaxMembers         int
 	MaxContribution    float64
 	CollateralRequired float64
-}
-
-var tierMatrix = map[UserTier]tierConfig{
-	TierBasic:    {MaxMembers: 10, MaxContribution: 100, CollateralRequired: 50},
-	TierVerified: {MaxMembers: 30, MaxContribution: 500, CollateralRequired: 100},
-	TierPremium:  {MaxMembers: 100, MaxContribution: 5000, CollateralRequired: 200},
 }
 
 // ReentrancyGuard is a simple non-reentrant mutex for testing.

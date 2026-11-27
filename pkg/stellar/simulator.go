@@ -8,6 +8,8 @@ import (
 	"io"
 	"net/http"
 	"time"
+
+	"github.com/rs/zerolog/log"
 )
 
 // SimulationResult is the result of simulating a transaction
@@ -62,7 +64,11 @@ func (s *Simulator) SimulateTransaction(ctx context.Context, tx *Transaction) (*
 	if err != nil {
 		return nil, fmt.Errorf("simulation request: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if cerr := resp.Body.Close(); cerr != nil {
+			log.Warn().Err(cerr).Msg("failed to close simulation response body")
+		}
+	}()
 
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -93,10 +99,7 @@ func (s *Simulator) SimulateTransaction(ctx context.Context, tx *Transaction) (*
 
 // ApplyResources applies the resource estimates from simulation to the transaction
 func (s *Simulator) ApplyResources(tx *Transaction, result *SimulationResult) *Transaction {
-	costFactor := int64(result.Cost.CPUInstructions/10000 + result.Cost.MemoryBytes/100)
-	if costFactor > 1000 {
-		costFactor = 1000
-	}
+	costFactor := ResourceCostFactor(result.Cost.CPUInstructions, result.Cost.MemoryBytes)
 	tx.Fee = tx.Fee * costFactor
 	if tx.Fee < 100 {
 		tx.Fee = 100

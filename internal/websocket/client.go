@@ -2,6 +2,7 @@ package websocket
 
 import (
 	"encoding/json"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -23,8 +24,9 @@ const (
 	// Send pings to peer with this period. Must be less than pongWait.
 	pingPeriod = (pongWait * 9) / 10
 
-	// Maximum message size allowed from peer.
-	maxMessageSize = 4096
+	// DefaultMaxMessageSize is the largest inbound frame a peer may send unless
+	// server.websocket_max_message_size overrides it.
+	DefaultMaxMessageSize = 4096
 
 	// Send channel buffer size.
 	sendBufferSize = 256
@@ -42,7 +44,6 @@ type Client struct {
 	Conn        *websocket.Conn
 	Send        chan []byte
 	missedPings atomic.Int32
-	mu          sync.Mutex
 	closing     chan struct{}
 	closeOnce   sync.Once
 
@@ -50,18 +51,28 @@ type Client struct {
 	// frame on shutdown; zero means pick a default jittered delay.
 	reconnectAfter atomic.Int64
 	subscribeLimit tokenBucket
+	maxMessageSize int64
 }
 
 // NewClient creates a new Client bound to the given Hub and WebSocket
 // connection. The userID identifies the authenticated user.
 func NewClient(hub *Hub, conn *websocket.Conn, userID string) *Client {
 	return &Client{
-		ID:      uuid.New().String(),
-		UserID:  userID,
-		Hub:     hub,
-		Conn:    conn,
-		Send:    make(chan []byte, sendBufferSize),
-		closing: make(chan struct{}),
+		ID:             uuid.New().String(),
+		UserID:         userID,
+		Hub:            hub,
+		Conn:           conn,
+		Send:           make(chan []byte, sendBufferSize),
+		closing:        make(chan struct{}),
+		maxMessageSize: DefaultMaxMessageSize,
+	}
+}
+
+// SetMaxMessageSize sets the per-connection inbound frame limit in bytes. It
+// must be called before ReadPump starts; non-positive values are ignored.
+func (c *Client) SetMaxMessageSize(size int64) {
+	if size > 0 {
+		c.maxMessageSize = size
 	}
 }
 
@@ -77,7 +88,7 @@ func (c *Client) Close() {
 			return
 		}
 		if c.Conn != nil {
-			_ = c.Conn.Close()
+			c.logError("close", c.Conn.Close())
 		}
 	})
 }
@@ -94,7 +105,7 @@ func (c *Client) Close() {
 func (c *Client) Disconnect() {
 	c.closeOnce.Do(func() {
 		if c.Conn != nil {
-			_ = c.Conn.Close()
+			c.logError("disconnect", c.Conn.Close())
 		}
 		if c.closing != nil {
 			close(c.closing)
@@ -107,10 +118,10 @@ func (c *Client) Disconnect() {
 func (c *Client) Kick(code int, reason string) {
 	c.closeOnce.Do(func() {
 		if c.Conn != nil {
-			c.Conn.SetWriteDeadline(time.Now().Add(writeWait))
-			_ = c.Conn.WriteMessage(websocket.CloseMessage,
-				websocket.FormatCloseMessage(code, reason))
-			_ = c.Conn.Close()
+			c.logError("set close deadline", c.Conn.SetWriteDeadline(time.Now().Add(writeWait)))
+			c.logError("write close message", c.Conn.WriteMessage(websocket.CloseMessage,
+				websocket.FormatCloseMessage(code, reason)))
+			c.logError("close", c.Conn.Close())
 		}
 		if c.closing != nil {
 			close(c.closing)
@@ -123,24 +134,35 @@ func (c *Client) Kick(code int, reason string) {
 // The application runs ReadPump in a per-connection goroutine. It ensures
 // there is at most one reader on a connection by executing all reads from
 // this goroutine. When the connection is closed, the client is unregistered.
+//
+// A frame larger than the connection's limit (#461) makes gorilla close the
+// socket with 1009 (message too big) before the payload is buffered.
 func (c *Client) ReadPump() {
 	defer func() {
 		c.Hub.Unregister(c)
-		c.Conn.Close()
+		c.logError("close after read", c.Conn.Close())
 	}()
 
-	c.Conn.SetReadLimit(maxMessageSize)
-	c.Conn.SetReadDeadline(time.Now().Add(pongWait))
+	c.Conn.SetReadLimit(c.maxMessageSize)
+	if err := c.Conn.SetReadDeadline(time.Now().Add(pongWait)); err != nil {
+		log.Warn().Err(err).Str("clientID", c.ID).Msg("failed to set websocket read deadline")
+		return
+	}
 	c.Conn.SetPongHandler(func(string) error {
 		c.missedPings.Store(0)
-		c.Conn.SetReadDeadline(time.Now().Add(pongWait))
-		return nil
+		// A failed deadline means the connection is unusable; returning the
+		// error ends the read loop in ReadPump.
+		return c.Conn.SetReadDeadline(time.Now().Add(pongWait))
 	})
 
 	for {
 		_, msgBytes, err := c.Conn.ReadMessage()
 		if err != nil {
-			if websocket.IsUnexpectedCloseError(
+			if errors.Is(err, websocket.ErrReadLimit) {
+				metrics.WSOversizedMessagesTotal.Inc()
+				log.Warn().Str("clientID", c.ID).Str("userID", c.UserID).Int64("limitBytes", c.maxMessageSize).
+					Msg("closing websocket: inbound message exceeds per-connection size limit")
+			} else if websocket.IsUnexpectedCloseError(
 				err,
 				websocket.CloseGoingAway,
 				websocket.CloseAbnormalClosure,
@@ -165,26 +187,29 @@ func (c *Client) WritePump() {
 	ticker := time.NewTicker(pingPeriod)
 	defer func() {
 		ticker.Stop()
-		c.Conn.Close()
+		c.logError("close after write", c.Conn.Close())
 	}()
 
 	for {
 		select {
 		case <-c.closing:
 			// Server is shutting down: tell the peer to reconnect elsewhere.
-			c.Conn.SetWriteDeadline(time.Now().Add(writeWait))
+			c.logError("set shutdown deadline", c.Conn.SetWriteDeadline(time.Now().Add(writeWait)))
 			delay := time.Duration(c.reconnectAfter.Load())
 			if delay <= 0 {
 				delay = reconnectDelay(reconnectSpread(0))
 			}
-			_ = c.Conn.WriteMessage(websocket.CloseMessage,
-				websocket.FormatCloseMessage(websocket.CloseGoingAway, shutdownCloseReason(delay)))
+			c.logError("write shutdown message", c.Conn.WriteMessage(websocket.CloseMessage,
+				websocket.FormatCloseMessage(websocket.CloseGoingAway, shutdownCloseReason(delay))))
 			return
 		case msg, ok := <-c.Send:
-			c.Conn.SetWriteDeadline(time.Now().Add(writeWait))
+			if err := c.Conn.SetWriteDeadline(time.Now().Add(writeWait)); err != nil {
+				log.Warn().Err(err).Str("clientID", c.ID).Msg("websocket write error")
+				return
+			}
 			if !ok {
 				// Hub closed the Send channel — close the connection
-				c.Conn.WriteMessage(websocket.CloseMessage, []byte{})
+				c.logError("write empty close message", c.Conn.WriteMessage(websocket.CloseMessage, []byte{}))
 				return
 			}
 			if err := c.Conn.WriteMessage(websocket.TextMessage, msg); err != nil {
@@ -200,11 +225,19 @@ func (c *Client) WritePump() {
 			}
 			c.missedPings.Add(1)
 
-			c.Conn.SetWriteDeadline(time.Now().Add(writeWait))
+			if err := c.Conn.SetWriteDeadline(time.Now().Add(writeWait)); err != nil {
+				return
+			}
 			if err := c.Conn.WriteMessage(websocket.PingMessage, nil); err != nil {
 				return
 			}
 		}
+	}
+}
+
+func (c *Client) logError(operation string, err error) {
+	if err != nil {
+		log.Warn().Err(err).Str("clientID", c.ID).Str("operation", operation).Msg("websocket operation failed")
 	}
 }
 
